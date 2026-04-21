@@ -1,7 +1,30 @@
 import { k8s } from '../k8s'
 import { RuntimeUpgradeContext } from '../runtime-upgrades/runtime-upgrades'
 
-export const upgradeKnativeServing = async (context: RuntimeUpgradeContext) => {
+export const deleteKnativeServingCR = async (context: RuntimeUpgradeContext): Promise<void> => {
+  const group = 'operator.knative.dev'
+  const version = 'v1beta1'
+  const plural = 'knativeservings'
+  const name = 'knative-serving'
+  const namespace = 'knative-serving'
+  const client = k8s.custom()
+
+  try {
+    await client.deleteNamespacedCustomObject({ group, version, namespace, plural, name })
+    context.debug.info('KnativeServing CR deleted successfully.')
+  } catch (err: any) {
+    if (err?.statusCode === 404) {
+      context.debug.info('KnativeServing CR not found, skipping deletion.')
+    } else {
+      throw err
+    }
+  }
+}
+
+export const upgradeKnativeServing = async (
+  context: RuntimeUpgradeContext,
+  targetVersions: string[] = ['1.16', '1.17', '1.18'],
+) => {
   const group = 'operator.knative.dev'
   const version = 'v1beta1'
   const plural = 'knativeservings'
@@ -24,7 +47,7 @@ export const upgradeKnativeServing = async (context: RuntimeUpgradeContext) => {
       return
     }
 
-    for (const targetVersion of ['1.16', '1.17', '1.18']) {
+    for (const targetVersion of targetVersions) {
       context.debug.info(`Patching KnativeServing to ${targetVersion}...`)
       await client.patchNamespacedCustomObject({
         group,

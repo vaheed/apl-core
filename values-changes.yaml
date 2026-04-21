@@ -446,3 +446,30 @@ changes:
     relocations:
       - apps.gitea.adminPassword: otomi.git.password
       - apps.gitea.adminUsername: otomi.git.username
+  - version: 56
+    customFunctions:
+      - addLinodeNBAnnotations
+  - version: 57
+    customFunctions:
+      - setIngressDefault
+  - version: 58
+    additions:
+      - apps.tekton.enabled: true
+  - version: 59
+    customFunctions:
+      - valkeyAndOauth2RedisPVCMigration
+  - version: 60
+    customFunctions:
+      - addRedisSecretForArgoCD
+  - version: 61
+    deletions:
+      - 'kms.sops'
+    customFunctions:
+      - sopsMigration
+  - version: 62
+    customFunctions:
+      - removeIngressTracing
+    deletions:
+      - 'apps.istio.tracing'
+      - 'apps.otel.otlpCollector'
+      - 'apps.otel.resources.otlpCollector'

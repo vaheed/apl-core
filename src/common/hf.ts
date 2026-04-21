@@ -17,7 +17,15 @@ const replaceHFPaths = (output: string, envDir = env.ENV_DIR): string => output.
 export const HF_DEFAULT_SYNC_ARGS = [
   'sync',
   '--concurrency=1',
+  '--sync-args',
+  // These two need to be in same string as is passed as single argument to --sync-args
+  '--disable-openapi-validation --qps=20',
+]
+
+export const HF_DEFAULT_SYNC_ON_INITIAL_INSTALL_ARGS = [
+  'sync',
   '--reuse-values', // Preserve values from existing releases on retry - makes install idempotent
+  '--concurrency=1',
   '--sync-args',
   // These two need to be in same string as is passed as single argument to --sync-args
   '--disable-openapi-validation --qps=20',
@@ -64,10 +72,12 @@ const hfCore = (args: HFParams, envDir = env.ENV_DIR): ProcessPromise => {
   stringArray.push(`--log-level=${paramsCopy.logLevel.toLowerCase()}`)
   process.env.HELM_DIFF_COLOR = 'true'
   process.env.HELM_DIFF_USE_UPGRADE_DRY_RUN = 'true'
+  // Always run helmfile from rootDir to ensure helmfile.d/ is found regardless of process cwd
+  const $hf = $({ cwd: rootDir })
   if ((parsedArgs?.dryRun || parsedArgs?.local) && paramsCopy.args.includes('sync')) {
-    return $`echo ENV_DIR=${envDir} helmfile ${stringArray} ${paramsCopy.args}`.quiet()
+    return $hf`echo ENV_DIR=${envDir} helmfile ${stringArray} ${paramsCopy.args}`.quiet()
   } else {
-    return $`ENV_DIR=${envDir} helmfile ${stringArray} ${paramsCopy.args}`.quiet()
+    return $hf`ENV_DIR=${envDir} helmfile ${stringArray} ${paramsCopy.args}`.quiet()
   }
 }
 

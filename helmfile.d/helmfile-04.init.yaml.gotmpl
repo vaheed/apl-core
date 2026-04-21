@@ -25,6 +25,13 @@ releases:
     labels:
       pkg: apl-operator
     <<: *default
+  - name: apl-operator-artifacts
+    installed: true
+    namespace: apl-operator
+    labels:
+      pkg: apl-operator
+      app: core
+    <<: *raw
   - name: otomi-operator
     installed: true
     namespace: otomi-operator
@@ -78,16 +85,28 @@ releases:
     namespace: rabbitmq
     <<: *default
   - name: tekton-pipelines
-    installed: true
+    installed: {{ $a | get "tekton.enabled" }}
     namespace: tekton-pipelines
     labels:
       pkg: tekton-pipelines
     <<: *default
-  - name: tekton-dashboard
-    installed: true
+  - name: tekton-pipelines-artifacts
+    installed: {{ $a | get "tekton.enabled" }}
     namespace: tekton-pipelines
+    labels:
+      pkg: tekton-pipelines
+    <<: *raw
+  - name: tekton-dashboard
+    installed: {{ $a | get "tekton.enabled" }}
+    namespace: tekton-dashboard
     labels:
       pkg: tekton-pipelines
     chart: ../charts/tekton-dashboard
     values:
       - ../values/tekton-dashboard/tekton-dashboard.gotmpl
+  - name: tekton-dashboard-artifacts
+    installed: {{ $a | get "tekton.enabled" }}
+    namespace: tekton-dashboard
+    labels:
+      pkg: tekton-pipelines
+    <<: *raw

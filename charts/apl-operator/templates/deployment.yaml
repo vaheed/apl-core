@@ -35,17 +35,33 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           workingDir: /home/app/stack
+          {{- with .Values.command }}
           command:
-            - node
-            - dist/src/operator/main.js
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.commandArgs }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           env:
             - name: CI
               value: "true"
           envFrom:
             - secretRef:
                 name: apl-sops-secrets
+                optional: true
             - secretRef:
                 name: apl-git-credentials
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "test $(( $(date +%s) - $(date -r /tmp/heartbeat +%s) )) -le 900"
+            initialDelaySeconds: 180
+            periodSeconds: 60
+            failureThreshold: 1
+            timeoutSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:

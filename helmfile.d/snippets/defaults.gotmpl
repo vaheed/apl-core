@@ -1,4 +1,5 @@
 {{- /* Only dynamic defaults */}}
+{{- $versions := (readFile "../versions.yaml" | fromYaml) }}
 {{- $ENV_DIR := env "ENV_DIR" | default "../env" }}
 {{- $dirPath := printf "%s/env/teams" $ENV_DIR }}
 {{- $ingressFilePath := printf "%s/env/settings/ingress.yaml" $ENV_DIR }}
@@ -22,10 +23,14 @@ environments:
   default:
     values:
     - apps:
-        kubeflow-pipelines:
-          rootPassword: {{ randAlphaNum 32 }}
-        {{- range $index,$ingressClassName := $ingressClassNames }}
-        ingress-nginx-{{ $ingressClassName}}:
+        argocd: {}
+        kubeflow-pipelines: {}
+        gitea: {}
+        {{- range $index, $ingressClassName := $ingressClassNames }}
+        ingress-nginx-{{ $ingressClassName }}:
+          {{- if eq $ingressClassName "platform" }}
+          enabled: false
+          {{- end }}
           autoscaling:
             enabled: true
             minReplicas: 2
@@ -36,9 +41,6 @@ environments:
             enabled: false
             block: false
             owasp: true
-          tracing:
-            enabled: false
-            samplingRatio: "0.01"
           maxBodySize: 1024m
           maxBodySizeBytes: 1073741824
           resources:
@@ -267,13 +269,15 @@ environments:
                 useCloudShell: true
                 downloadKubeconfig: true
                 downloadDockerLogin: true
-            password: {{ randAlphaNum 32 }}
       {{- end }}
       {{- end }}
-      otomi:
-        adminPassword: {{ randAlphaNum 32 }}
-        git:
-          password: {{ randAlphaNum 20 }}
+      otomi: {}
+      catalogs:
+        default:
+          name: default
+          repositoryUrl: https://github.com/linode/apl-charts.git
+          branch: {{ $versions.aplCharts }}
+          enabled: true
       cluster:
         owner: customer
         name: apl

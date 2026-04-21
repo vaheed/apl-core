@@ -6,6 +6,7 @@
 {{- $teamServices := ($team | get "services" list) }}
 {{- $domain := ($v.cluster | get "domainSuffix" nil) }}
 {{- $keycloakRealm := printf "https://%s/realms/otomi" $v._derived.keycloakDomain }}
+{{- $httpRoute := tpl (readFile "../../helmfile.d/snippets/routes.gotmpl") $v | fromYaml }}
 {{- $logoutRedirectParam := printf "%s/protocol/openid-connect/logout?post_logout_redirect_uri=https://%s&client_id=%s" $keycloakRealm $v._derived.consoleDomain $a.keycloak.idp.clientID }}
 
 {{- if $v.otomi.linodeLkeImageRepository }}
@@ -39,6 +40,8 @@ apps:
     enabled: {{ $a.argocd.enabled }}
   kyverno:
     enabled: {{ $a.kyverno.enabled }}
+  tekton:
+    enabled: {{ $a.tekton.enabled }}
 
 aiEnabled: {{ $v.otomi.aiEnabled }}
 isMultitenant: {{ $v.otomi.isMultitenant }}
@@ -57,15 +60,17 @@ managedMonitoring: {{- $team | get "settings.managedMonitoring" dict | toYaml | 
 teamId: {{ $teamId }}
 teamApps: {{- toYaml $teamApps | nindent 2 }}
 teamIds: {{- toYaml (keys $v.teamConfig | sortAlpha) | nindent 2 }}
-tracingEnabled: {{ $a.istio.tracing.enabled }}
 services: {{- concat $coreTeamServices $teamServices | toYaml | nindent 2 }}
 resourceQuota: {{- $teamResourceQuotas | toYaml | nindent 2 }}
 ingressGatewayPrefix: {{ $v._derived.ingressGatewayPrefix }}
 ingressPublicGatewayName: {{ $v._derived.ingressPublicGatewayName }}
 defaultIngressGatewayLabel: {{ $v._derived.defaultIngressGatewayLabel }}
 canaryIngressGatewayLabel: {{ $v._derived.canaryIngressGatewayLabel | quote }}
+useLegacyIngress: {{ $a | get "ingress-nginx-platform.enabled" }}
+httpRouteAnnotations: {{- $httpRoute.annotations | toYaml | nindent 2 }}
 
 gitOps:
+  branch: {{ $v.otomi.git.branch }}
 {{- if contains "gitea-http.gitea.svc.cluster.local" $v.otomi.git.repoUrl }}
   teamRepoUrl:  "https://{{ $v._derived.giteaDomain }}/otomi/team-{{ $teamId }}-argocd.git"
   valuesRepoUrl: "https://{{ $v._derived.giteaDomain }}/otomi/values.git"

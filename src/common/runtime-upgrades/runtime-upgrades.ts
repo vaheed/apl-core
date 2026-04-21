@@ -2,13 +2,14 @@ import { ApiException, PatchStrategy, setHeaderOptions } from '@kubernetes/clien
 import { OtomiDebugger } from '../debug'
 import { applyServerSide, k8s, restartOtomiApiDeployment } from '../k8s'
 import { getParsedArgs } from '../yargs'
+import { removeTektonDashboardApp, syncIngressNginxService } from './ingress-resource-pre-migration'
 import { updateDbCollation } from './cloudnative-pg'
+import { migrateGitConfig } from './migrate-git-config'
+import { removeHttpBinApplication } from './remove-httpbin-application'
 import { removeOldMinioResources } from './remove-old-minio-resources'
 import { detectAndRestartOutdatedIstioSidecars } from './restart-istio-sidecars'
-import { upgradeKnativeServing } from './upgrade-knative-serving-cr'
+import { deleteKnativeServingCR, upgradeKnativeServing } from './upgrade-knative-serving-cr'
 import { detachApplicationFromApplicationSet, pruneArgoCDImageUpdater } from './v4.13.0'
-import { removeHttpBinApplication } from './remove-httpbin-application'
-import { migrateGitConfig } from './migrate-git-config'
 
 export interface RuntimeUpgradeContext {
   debug: OtomiDebugger
@@ -160,6 +161,18 @@ export const runtimeUpgrades: RuntimeUpgrades = [
           await detectAndRestartOutdatedIstioSidecars(k8s.core())
         },
       },
+      'knative-operator-knative-operator': {
+        post: async (context: RuntimeUpgradeContext) => {
+          await deleteKnativeServingCR(context)
+        },
+      },
+    },
+  },
+  {
+    version: '4.16.0',
+    pre: async (context: RuntimeUpgradeContext) => {
+      await syncIngressNginxService(context)
+      await removeTektonDashboardApp(context)
     },
   },
 ]

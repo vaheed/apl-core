@@ -5,19 +5,25 @@ import { hfValues } from 'src/common/hf'
 import { getFilename } from 'src/common/utils'
 import { HelmArguments, setParsedArgs } from 'src/common/yargs'
 import { Argv } from 'yargs'
-import { $, cd } from 'zx'
+import { $ } from 'zx'
+import { getRepo } from '../common/git-config'
 
 const cmdName = getFilename(__filename)
 
 export const pull = async (): Promise<void> => {
   const d = terminal(`cmd:${cmdName}:pull`)
   const allValues = await hfValues()
-  const branch = allValues?.apps?.['otomi-api']?.git?.branch ?? 'main'
+  if (!allValues) {
+    d.error('No values found, skipping git pull')
+    return
+  }
+  const gitRepo = await getRepo(allValues)
+  const { branch } = gitRepo
   d.info('Pulling latest values')
-  cd(env.ENV_DIR)
+  const $git = $({ cwd: env.ENV_DIR })
   try {
-    await $`git fetch`
-    await $`if git --no-pager log --decorate=short --pretty=oneline -n1; then git merge origin/${branch}; fi`
+    await $git`git fetch`
+    await $git`if git --no-pager log --decorate=short --pretty=oneline -n1; then git merge origin/${branch}; fi`
   } catch (error) {
     d.warn(
       `An error occured when trying to pull (maybe not problematic).\nIf you see merge conflicts then please resolve these and run \`otomi commit\` again.`,

@@ -58,6 +58,8 @@ k8s:
     - name: kyverno
       app: kyverno
       disableIstioInjection: true
+    - name: tekton-dashboard
+      app: tekton-pipelines
     - name: tekton-pipelines
       disableIstioInjection: true
       disablePolicyChecks: true
@@ -87,6 +89,11 @@ k8s:
       disablePolicyChecks: true
     - name: sealed-secrets
       app: sealed-secrets
+    - name: external-secrets
+      app: external-secrets
+      disableIstioInjection: true
+    - name: apl-secrets
+      disableIstioInjection: true
     - name: policy-reporter
       app: policy-reporter
       disablePolicyChecks: true
@@ -210,7 +217,7 @@ adminApps:
     path: /#/namespaces/team-admin/pipelineruns
     ingress:
       - svc: tekton-dashboard
-        namespace: tekton-pipelines
+        namespace: tekton-dashboard
         port: 9097
         type: public
         auth: true

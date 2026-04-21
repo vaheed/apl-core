@@ -225,8 +225,8 @@ environments:
                   memory: 512Mi
               registry:
                 requests:
-                  cpu: 20m
-                  memory: 32Mi
+                  cpu: 100m
+                  memory: 128Mi
                 limits:
                   cpu: 500m
                   memory: 256Mi
@@ -253,9 +253,6 @@ environments:
                   cpu: 200m
             _rawValues: {}
           istio:
-            tracing:
-              enabled: false
-              samplingRatio: "0.01"
             autoscaling:
               egressgateway:
                 minReplicas: 2
@@ -334,6 +331,22 @@ environments:
             enabled: false
             serving:
               replicas: 1
+              gateway:
+                replicas: 2
+                minAvailable: 1
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                  limits:
+                    cpu: 1000m
+                    memory: 1024Mi
+                autoscaling:
+                  enabled: true
+                  minReplicas: 2
+                  maxReplicas: 10
+                  targetCPUUtilizationPercentage: 80
+                  targetMemoryUtilizationPercentage: 80
             resources:
               queueSidecar:
                 requests:
@@ -560,6 +573,7 @@ environments:
                 memory: 512Mi
             _rawValues: {}
           tekton:
+            enabled: false
             resources:
               dashboard:
                 limits:
@@ -922,29 +936,9 @@ environments:
             _rawValues: {}
           otel:
             enabled: false
-            otlpCollector:
-              autoscaler:
-                minReplicas: 2
-                maxReplicas: 5
-                targetCPUUtilizationPercentage: 80
-                targetMemoryUtilizationPercentage: 80
-              attributes:
-                - k8s.pod.name
-                - k8s.pod.uid
-                - k8s.deployment.name
-                - k8s.namespace.name
-                - k8s.node.name
-                - k8s.pod.start_time
             operator:
               replicaCount: 1
             resources:
-              otlpCollector:
-                requests:
-                  cpu: 50m
-                  memory: 256Mi
-                limits:
-                  cpu: "1"
-                  memory: 1Gi
               logsCollector:
                 requests:
                   cpu: 50m
@@ -976,6 +970,16 @@ environments:
                 limits:
                   cpu: "2"
                   memory: 1Gi
+            _rawValues: {}
+          external-secrets:
+            resources:
+              operator:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
             _rawValues: {}
           rabbitmq:
             enabled: false
@@ -1138,6 +1142,22 @@ environments:
         ingress:
           platformClass:
             className: platform
+            gateway:
+              replicas: 3
+              minAvailable: 1
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1024Mi
+              autoscaling:
+                enabled: true
+                minReplicas: 3
+                maxReplicas: 10
+                targetCPUUtilizationPercentage: 80
+                targetMemoryUtilizationPercentage: 80
           classes: []
         alerts:
           receivers:
@@ -1156,12 +1176,5 @@ environments:
           useORCS: true
           aiEnabled: false
         users: []
-        # TODO: update this when schema version changes
-        catalogs:
-          default:
-            name: default
-            repositoryUrl: https://github.com/linode/apl-charts.git
-            branch: main
-            enabled: true
         versions:
-          specVersion: 55
+          specVersion: 62

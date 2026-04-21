@@ -2,16 +2,11 @@
 {{- $h := $v.apps.harbor }}
 {{- $db := $v.databases.harbor }}
 {{- $obj := $v.obj.provider }}
-{{- $harborDomain := printf "harbor.%s" $v.cluster.domainSuffix }}
-{{- $notaryDomain := printf "notary.%s" $v.cluster.domainSuffix }}
-{{- $harborSecretName := ($harborDomain | replace "." "-") }}
-{{- $notarySecretName := ($notaryDomain | replace "." "-") }}
-{{- $externalUrl := printf "https://%s" $harborDomain }}
-{{/*The cloudNativeDb operator is responsible for creating the secret*/}}
+{{- $harborDomain := printf $v._derived.harborDomain }}
+{{- $httpRoute := tpl (readFile "../../helmfile.d/snippets/routes.gotmpl") $v | fromYaml }}
 
-externalURL: {{ $externalUrl }}
+externalURL: https://{{ $harborDomain }}
 fullnameOverride: harbor
-# logLevel - debug, info, warning, error or fatal
 logLevel: warning
 
 existingSecretAdminPassword: harbor-admin-password
@@ -31,7 +26,14 @@ core:
 
   resources: {{- $h.resources.core | toYaml | nindent 4 }}
   existingSecret: harbor-core-secret
-  xsrfKey: {{ $h | get "core.xsrfKey" nil }}
+  existingXsrfSecret: harbor-core-xsrf-secret
+  existingXsrfSecretKey: CSRF_KEY
+  extraEnvVars:
+    - name: REGISTRY_CREDENTIAL_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: harbor-registry-credentials
+          key: REGISTRY_USERNAME
 
 database:
   maxOpenConns: {{ $h.databaseMaxConnections }}
@@ -53,9 +55,18 @@ exporter:
     {{- end }}
 
 expose:
+  type: route
   tls:
     enabled: false
-  type: clusterIP
+  route:
+    {{- with $httpRoute.annotations }}
+    annotations:
+      {{- . | toYaml | nindent 6 }}
+    {{- end }}
+    parentRefs:
+      {{- $httpRoute.parentRefs | toYaml | nindent 6 }}
+    hosts:
+      - {{ $v._derived.harborDomain }}
 
 jobservice:
   priorityClassName: otomi-critical
@@ -68,6 +79,12 @@ jobservice:
     - stdout
   resources: {{- $h.resources.jobservice | toYaml | nindent 4 }}
   existingSecret: harbor-jobservice-secret
+  extraEnvVars:
+    - name: REGISTRY_CREDENTIAL_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: harbor-registry-credentials
+          key: REGISTRY_USERNAME
 
 metrics:
   serviceMonitor:
@@ -149,6 +166,9 @@ portal:
     repository: "{{- $v.otomi.linodeLkeImageRepository }}/docker/goharbor/harbor-portal"
   {{- end }}
   resources: {{- $h.resources.portal | toYaml | nindent 4 }}
+  podLabels:
+    otomi.io/auth: platform
+    otomi.io/auth-policy: platform
 
 redis:
   internal:

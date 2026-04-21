@@ -1,6 +1,9 @@
 import type { CoreV1Api } from '@kubernetes/client-node'
-import { APL_OPERATOR_NS } from './constants'
+import { APL_OPERATOR_NS, OTOMI_SECRETS, SEALED_SECRETS_NAMESPACE } from './constants'
+import { terminal } from './debug'
 import { createUpdateConfigMap, getK8sConfigMap, getK8sSecret, k8s } from './k8s'
+
+const d = terminal('common:git-config')
 
 // Constants
 export const GIT_CONFIG_CONFIGMAP_NAME = 'apl-git-config'
@@ -10,13 +13,15 @@ export const GIT_CONFIG_NAMESPACE = APL_OPERATOR_NS
 /**
  * Unified Git repository configuration with credentials.
  * Contains both the base URL (without credentials) and the authenticated URL (with embedded credentials).
+ * The authenticatedUrl uses token-only auth (password/token in URL username position, no password field),
+ * which is the standard format for PAT/token-based git authentication.
  */
 export interface GitRepoConfig {
   repoUrl: string // URL without credentials (e.g., https://github.com/org/repo.git)
-  authenticatedUrl: string // URL with embedded credentials for git operations
+  authenticatedUrl: string // URL with token-only auth: https://TOKEN@host/path
   branch: string
   email: string
-  username: string
+  username?: string // Optional: only used for git commit author identity (git config user.name)
   password: string
 }
 
@@ -27,14 +32,19 @@ export interface GitConfigData {
 }
 
 export interface GitCredentials {
-  username: string
+  username?: string
   password: string
 }
 
 export async function getGitCredentials(): Promise<GitCredentials | undefined> {
   const secretData = await getK8sSecret(GIT_CONFIG_SECRET_NAME, GIT_CONFIG_NAMESPACE)
 
-  if (!secretData?.username || !secretData?.password) {
+  if (!secretData?.password) {
+    return undefined
+  }
+
+  // Reject unresolved sealed-secret placeholders (e.g. during first deploy before secrets are decrypted)
+  if (typeof secretData.password === 'string' && secretData.password.startsWith('sealed:')) {
     return undefined
   }
 
@@ -79,7 +89,7 @@ export async function getStoredGitRepoConfig(): Promise<GitRepoConfig> {
   }
 
   if (!credentials) {
-    throw new Error(`Git credentials not found in ${GIT_CONFIG_SECRET_NAME} & gitea-credentials secret`)
+    throw new Error(`Git password/token not found in ${GIT_CONFIG_SECRET_NAME} or gitea-credentials secret`)
   }
 
   // We cannot do hfValues because the env dir does not exist yet.
@@ -100,18 +110,23 @@ export async function getStoredGitRepoConfig(): Promise<GitRepoConfig> {
   if (!repoUrl) {
     throw new Error(`Git repository URL is missing in ${GIT_CONFIG_CONFIGMAP_NAME} config`)
   }
-  if (!username || !password) {
-    throw new Error(`Git credentials are incomplete in ${GIT_CONFIG_SECRET_NAME} secret`)
+  if (!password) {
+    throw new Error(`Git password/token is missing in ${GIT_CONFIG_SECRET_NAME} secret`)
   }
   if (!branch || !email) {
     throw new Error(`Git branch or email is missing in ${GIT_CONFIG_CONFIGMAP_NAME} config`)
   }
   const url = new URL(repoUrl)
-  url.username = username
-  url.password = password
+  if (username) {
+    url.username = username
+    url.password = password
+  } else {
+    url.username = password
+    url.password = ''
+  }
   const authenticatedUrl = url.toString()
 
-  return { repoUrl, authenticatedUrl, branch, email, username, password }
+  return { repoUrl, authenticatedUrl, branch, email, username, password } as GitRepoConfig
 }
 
 /**
@@ -131,8 +146,10 @@ export async function setGitConfig(config: Partial<GitConfigData>, coreV1Api?: C
 
 /**
  * Gets repository configuration from values, constructing the authenticated URL with embedded credentials.
+ * If password is missing or is an unresolved sealed-secret placeholder, falls back to reading
+ * the real password from the K8s secret (populated by ESO from SealedSecrets).
  */
-export const getRepo = (values: Record<string, any>): GitRepoConfig => {
+export const getRepo = async (values: Record<string, any>, deps = { getK8sSecret }): Promise<GitRepoConfig> => {
   const otomiGit = values?.otomi?.git
 
   if (!otomiGit?.repoUrl) {
@@ -141,16 +158,42 @@ export const getRepo = (values: Record<string, any>): GitRepoConfig => {
   if (process.env.NODE_ENV === 'development') {
     otomiGit.repoUrl = process.env.GIT_REPO_URL
   }
-  const username = otomiGit?.username
-  const password = otomiGit?.password
+  const username: string | undefined = otomiGit?.username
+  let password = ''
   const email = otomiGit?.email
   const branch = otomiGit?.branch
 
+  // Always try the K8s secret first for the real password.
+  // On disk, secrets are stripped — the values spec has no plaintext password.
+  try {
+    const secret = await deps.getK8sSecret(OTOMI_SECRETS, SEALED_SECRETS_NAMESPACE)
+    if (secret?.git_password) {
+      password = String(secret.git_password)
+      d.debug('Read git password from K8s secret (ESO)')
+    }
+  } catch {
+    d.debug('Could not read git password from K8s secret')
+  }
+
+  // Fall back to values if K8s secret is not available (e.g., during bootstrap)
+  if (!password) {
+    const valuesPassword = otomiGit?.password ?? ''
+    // Only use the values password if it's not an unresolved sealed-secret placeholder
+    if (valuesPassword && !(typeof valuesPassword === 'string' && valuesPassword.startsWith('sealed:'))) {
+      password = valuesPassword
+    }
+  }
+
   const repoUrl = otomiGit?.repoUrl as string
   const url = new URL(repoUrl)
-  url.username = username
-  url.password = password
+  if (username) {
+    url.username = username
+    url.password = password
+  } else {
+    url.username = password
+    url.password = ''
+  }
   const authenticatedUrl = url.toString()
 
-  return { repoUrl, authenticatedUrl, branch, email, username, password }
+  return { repoUrl, authenticatedUrl, branch, email, username, password } as GitRepoConfig
 }

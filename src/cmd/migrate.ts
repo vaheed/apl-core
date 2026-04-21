@@ -1,6 +1,6 @@
-import { ApiException } from '@kubernetes/client-node'
+import { ApiException, PatchStrategy, setHeaderOptions } from '@kubernetes/client-node'
 import { encryptSecretItem } from '@linode/kubeseal-encrypt'
-import { randomUUID } from 'crypto'
+import { randomBytes, randomUUID } from 'crypto'
 import { diff } from 'deep-diff'
 import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'fs'
 import { cp, rename as fsRename, mkdir, readFile, writeFile } from 'fs/promises'
@@ -19,11 +19,35 @@ import { BasicArguments, getParsedArgs, setParsedArgs } from 'src/common/yargs'
 import { v4 as uuidv4 } from 'uuid'
 import { parse } from 'yaml'
 import { Argv } from 'yargs'
-import { $, cd } from 'zx'
-import { APL_OPERATOR_NS, ARGOCD_APP_PARAMS } from '../common/constants'
-import { getSealedSecretsPEM, k8s } from '../common/k8s'
+import { $, cd, sleep } from 'zx'
+import { APL_OPERATOR_NS, ARGOCD_APP_PARAMS, OTOMI_SECRETS, SEALED_SECRETS_NAMESPACE } from '../common/constants'
+import {
+  createArgoCdRedisSecret,
+  getArgoCdApp,
+  getK8sSecret,
+  getSealedSecretsPEM,
+  k8s,
+  restartDeployment,
+  restartStatefulSet,
+  setArgoCdAppSync,
+} from '../common/k8s'
+import {
+  applySealedSecretManifestsFromDir,
+  buildSecretToNamespaceMap,
+  createSealedSecretManifest,
+  createSealedSecretsKeySecret,
+  createUserSealedSecretManifests,
+  generateSealedSecretsKeyPair,
+  getExistingSealedSecretsCert,
+  getOrCreateSealedSecretsPem,
+  getPemFromCertificate,
+  restartSealedSecretsController,
+  SealedSecretManifest,
+  writeSealedSecretManifests,
+} from '../common/sealed-secrets'
 
 const cmdName = getFilename(__filename)
+const sealedSecretManifestsGlob = `${env.ENV_DIR}/env/manifests/namespaces/**/sealedsecrets/*.yaml`
 
 interface Arguments extends BasicArguments {
   dryRun?: boolean
@@ -61,11 +85,11 @@ interface Change {
 
 export type Changes = Array<Change>
 
-export const deleteFile = async (
+export const deleteFile = (
   relativeFilePath: string,
   dryRun = false,
   deps = { existsSync, renameSync, terminal, rmSync },
-): Promise<void> => {
+): void => {
   const d = deps.terminal(`cmd:${cmdName}:rename`)
   const path = `${env.ENV_DIR}/${relativeFilePath}`
   if (!deps.existsSync(path)) {
@@ -74,6 +98,17 @@ export const deleteFile = async (
   }
   if (!dryRun) {
     deps.rmSync(path)
+  }
+}
+
+export const processDeletionEntry = (entry: string, values: Record<string, any>, deps = { deleteFile }): void => {
+  unsetAtPath(entry, values)
+  const appMatch = entry.match(/^apps\.([^.\s]+)$/)
+  if (appMatch) {
+    const appName = appMatch[1]
+    deps.deleteFile(`env/apps/${appName}.yaml`)
+    deps.deleteFile(`env/apps/secrets.${appName}.yaml`)
+    deps.deleteFile(`env/apps/secrets.${appName}.yaml.dec`)
   }
 }
 
@@ -419,7 +454,7 @@ const buildImageNameMigration = async (values: Record<string, any>): Promise<voi
         set(build, 'imageName', build.name)
         const buildName = getBuildName(build.name, build.tag)
         set(build, 'name', buildName)
-        await deleteFile(`env/teams/${teamName}/builds/${build.imageName}.yaml`)
+        deleteFile(`env/teams/${teamName}/builds/${build.imageName}.yaml`)
       }
     }),
   )
@@ -507,6 +542,97 @@ async function appExists(name: string): Promise<boolean> {
         name,
       }),
   )
+}
+
+async function hasPvcWithStorageClass(
+  namespace: string,
+  labelSelector: string,
+  storageClassName: string,
+): Promise<boolean> {
+  try {
+    const pvcList = await k8s.core().listNamespacedPersistentVolumeClaim({ namespace, labelSelector })
+    return (pvcList?.items || []).some((pvc) => pvc?.spec?.storageClassName === storageClassName)
+  } catch (error) {
+    if (error instanceof ApiException && error.code === 404) {
+      return false
+    }
+    throw error
+  }
+}
+
+async function waitForPodsDeletion(namespace: string, labelSelector: string, timeoutMs = 300000): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const pods = await k8s.core().listNamespacedPod({ namespace, labelSelector })
+    if ((pods.items || []).length === 0) return
+    await sleep(5000)
+  }
+}
+
+async function waitForStatefulSetDeletion(name: string, namespace: string, timeoutMs = 300000): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const exists = await checkExists(async () => await k8s.app().readNamespacedStatefulSet({ name, namespace }))
+    if (!exists) return
+    await sleep(5000)
+  }
+}
+
+async function deletePvcsByLabel(namespace: string, labelSelector: string): Promise<void> {
+  const pvcList = await k8s.core().listNamespacedPersistentVolumeClaim({ namespace, labelSelector })
+  for (const pvc of pvcList.items || []) {
+    const name = pvc?.metadata?.name
+    if (!name) continue
+    try {
+      await k8s.core().deleteNamespacedPersistentVolumeClaim({ name, namespace })
+    } catch (error) {
+      if (!(error instanceof ApiException && error.code === 404)) throw error
+    }
+  }
+}
+
+async function migrateStatefulSetPvc(opts: {
+  appName: string
+  statefulSetName: string
+  namespace: string
+  pvcLabelSelector: string
+  d: ReturnType<typeof terminal>
+}): Promise<void> {
+  const parsedArgs = getParsedArgs()
+  if (parsedArgs?.dryRun || parsedArgs?.local) {
+    return
+  }
+
+  try {
+    const app = await getArgoCdApp(opts.appName, k8s.custom())
+    if (app) {
+      await setArgoCdAppSync(opts.appName, false, k8s.custom())
+    } else {
+      opts.d.info(`Argo CD application ${opts.appName} not found. Skipping sync disable.`)
+    }
+
+    await k8s.app().patchNamespacedStatefulSet(
+      {
+        name: opts.statefulSetName,
+        namespace: opts.namespace,
+        body: { spec: { replicas: 0 } },
+      },
+      setHeaderOptions('Content-Type', PatchStrategy.StrategicMergePatch),
+    )
+
+    await waitForPodsDeletion(opts.namespace, opts.pvcLabelSelector)
+    await deletePvcsByLabel(opts.namespace, opts.pvcLabelSelector)
+
+    try {
+      await k8s.app().deleteNamespacedStatefulSet({ name: opts.statefulSetName, namespace: opts.namespace })
+    } catch (error) {
+      if (!(error instanceof ApiException && error.code === 404)) throw error
+    }
+
+    await waitForStatefulSetDeletion(opts.statefulSetName, opts.namespace)
+  } catch (error) {
+    throw error
+  }
 }
 
 export async function addAplOperator(): Promise<void> {
@@ -702,6 +828,51 @@ const createCatalogSealedSecret = async (
   writeFileSync(sealedSecretPath, objectToYaml(sealedSecret))
 }
 
+// This migration changes PVCs when using Linode for gitea-valkey and oauth2-proxy-redis-server to use linode-block-storage instead of linode-block-storage-retain
+const valkeyAndOauth2RedisPVCMigration = async (values: Record<string, any>): Promise<void> => {
+  const d = terminal('valkeyAndOauth2RedisPVCMigration')
+  if (env.DISABLE_SYNC) {
+    d.info('Skipping Valkey and Oauth2 Redis PVC migration in dev/test environment')
+    return
+  }
+  const giteaEnabled = values?.apps?.gitea?.enabled
+  const isLinode = values?.cluster?.provider === 'linode'
+  const legacyStorageClass = 'linode-block-storage-retain'
+  if (isLinode) {
+    d.info('Changing PVC storage class to linode-block-storage for Gitea and OAuth2 Proxy Redis Server')
+    if (giteaEnabled) {
+      const hasLegacyGiteaPvc = await hasPvcWithStorageClass(
+        'gitea',
+        'app.kubernetes.io/name=valkey',
+        legacyStorageClass,
+      )
+      if (hasLegacyGiteaPvc) {
+        await migrateStatefulSetPvc({
+          appName: 'gitea-gitea-valkey',
+          statefulSetName: 'gitea-valkey-primary',
+          namespace: 'gitea',
+          pvcLabelSelector: 'app.kubernetes.io/name=valkey',
+          d,
+        })
+      } else {
+        d.info(`Skipping gitea PVC migration: no PVC found with storageClass ${legacyStorageClass}`)
+      }
+    }
+    const hasLegacyOauthPvc = await hasPvcWithStorageClass('istio-system', 'app=redis', legacyStorageClass)
+    if (hasLegacyOauthPvc) {
+      await migrateStatefulSetPvc({
+        appName: 'istio-system-oauth2-proxy',
+        statefulSetName: 'oauth2-proxy-redis-ha-server',
+        namespace: 'istio-system',
+        pvcLabelSelector: 'app=redis',
+        d,
+      })
+    } else {
+      d.info(`Skipping oauth2-proxy redis PVC migration: no PVC found with storageClass ${legacyStorageClass}`)
+    }
+  }
+}
+
 const setDefaultAplCatalog = async (values: Record<string, any>): Promise<void> => {
   const d = terminal('setDefaultAplCatalog')
   const gitea = values?.apps?.gitea as { adminUsername?: string; adminPassword?: string } | undefined
@@ -712,7 +883,12 @@ const setDefaultAplCatalog = async (values: Record<string, any>): Promise<void> 
   let secretCreated = false
   if (useGiteaCatalog) {
     try {
-      await createCatalogSealedSecret(d, gitea as { adminUsername: string; adminPassword: string })
+      const giteaSecrets = await getK8sSecret('gitea-secrets', SEALED_SECRETS_NAMESPACE)
+      const resolvedGitea = {
+        adminUsername: giteaSecrets?.adminUsername ? String(giteaSecrets.adminUsername) : String(gitea!.adminUsername),
+        adminPassword: giteaSecrets?.adminPassword ? String(giteaSecrets.adminPassword) : String(gitea!.adminPassword),
+      }
+      await createCatalogSealedSecret(d, resolvedGitea)
       secretCreated = true
     } catch (error) {
       d.error('Failed to create catalog sealed secret, continuing without it:', error)
@@ -735,6 +911,289 @@ const setDefaultAplCatalog = async (values: Record<string, any>): Promise<void> 
   set(values, 'catalogs.default', defaultCatalog)
 }
 
+export const addRedisSecretForArgoCD = async (values: Record<string, any>): Promise<void> => {
+  const d = terminal('addRedisSecretForArgoCD')
+  const argocdNamespace = 'argocd'
+
+  try {
+    const parsedArgs = getParsedArgs()
+    if (parsedArgs?.dryRun || parsedArgs?.local || env.DISABLE_SYNC) {
+      d.info('Skipping ArgoCD redis secret creation in dry-run/local/dev mode')
+      return
+    }
+
+    if (!(await namespaceExists(argocdNamespace))) {
+      d.info(`Namespace ${argocdNamespace} not found, skipping argocd-redis migration`)
+      return
+    }
+
+    // redisPassword is an x-secret field: never present in values on disk.
+    // Generate one and write it into the shared values object so sopsMigration (v61) seals the same password.
+    const redisPassword = randomBytes(24).toString('base64url')
+    set(values, 'apps.argocd.redisPassword', redisPassword)
+    await createArgoCdRedisSecret({ apps: { argocd: { redisPassword } } })
+
+    // Components consume REDIS_PASSWORD as env var, so they must restart after secret rotation.
+    const restartTargets = [
+      { kind: 'deployment', name: 'argocd-redis' },
+      { kind: 'deployment', name: 'argocd-server' },
+      { kind: 'deployment', name: 'argocd-repo-server' },
+      { kind: 'statefulset', name: 'argocd-application-controller' },
+      { kind: 'deployment', name: 'argocd-application-controller' },
+    ]
+    for (const target of restartTargets) {
+      try {
+        if (target.kind === 'deployment') {
+          await restartDeployment(target.name, argocdNamespace)
+        } else {
+          await restartStatefulSet(target.name, argocdNamespace)
+        }
+        d.info(`Restarted ${target.kind}/${target.name}`)
+      } catch (error) {
+        if (error instanceof ApiException && error.code === 404) {
+          d.debug(`Could not restart ${target.kind}/${target.name}: not found`)
+          continue
+        }
+        throw error
+      }
+    }
+  } catch (error) {
+    d.error('Failed to create/update ArgoCD redis secret, continuing migration:', error)
+  }
+}
+
+const addLinodeNBAnnotations = async (values: Record<string, any>): Promise<void> => {
+  const d = terminal('addLinodeNBAnnotations')
+  if (values?.cluster?.provider !== 'linode') {
+    d.info('Skipping Linode NodeBalancer annotation migration: provider is not linode')
+    return
+  }
+  if (env.DISABLE_SYNC) {
+    d.info('Skipping Linode NodeBalancer annotation migration in dev/test environment')
+    return
+  }
+
+  const linodeSecret = await getK8sSecret('linode', 'kube-system')
+  if (!linodeSecret?.token) {
+    d.warn('Linode secret not found or token missing in kube-system, skipping Linode NodeBalancer annotation migration')
+    return
+  }
+  const token = linodeSecret.token as string
+
+  d.info('Fetching external IP from ingress-nginx-platform-controller service')
+  let serviceIp: string | undefined
+  try {
+    const svc = await k8s
+      .core()
+      .readNamespacedService({ name: 'ingress-nginx-platform-controller', namespace: 'ingress' })
+    serviceIp = svc?.status?.loadBalancer?.ingress?.[0]?.ip
+  } catch (error) {
+    d.warn(`Error reading ingress-nginx-platform-controller service: ${error}`)
+    return
+  }
+  if (!serviceIp) {
+    d.warn(
+      'No external IP found on ingress-nginx-platform-controller service, skipping Linode NodeBalancer annotation migration',
+    )
+    return
+  }
+  d.info(`Found service external IP ${serviceIp}, querying Linode API for matching NodeBalancer`)
+  let nbId: number | undefined
+  try {
+    const response = await fetch('https://api.linode.com/v4/nodebalancers', {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    })
+    if (!response.ok) {
+      d.warn(`Failed to fetch NodeBalancers from Linode API: ${response.status} ${response.statusText}`)
+      return
+    }
+    const data = (await response.json()) as { data: Array<{ id: number; ipv4: string }> }
+    const nb = data.data?.find((n) => n.ipv4 === serviceIp)
+    if (!nb) {
+      d.warn(`No NodeBalancer found matching service IP ${serviceIp}, skipping`)
+      return
+    }
+    nbId = nb.id
+  } catch (error) {
+    d.warn(`Error querying Linode API: ${error}`)
+    return
+  }
+
+  d.info(`Found NodeBalancer ID ${nbId}, adding annotations to ingress.platformClass`)
+  const annotations: Array<{ key: string; value: string }> = get(values, 'ingress.platformClass.annotations', [])
+  const preserveKey = 'service.beta.kubernetes.io/linode-loadbalancer-preserve'
+  const nbIdKey = 'service.beta.kubernetes.io/linode-loadbalancer-nodebalancer-id'
+  if (!annotations.find((a) => a.key === preserveKey)) {
+    annotations.push({ key: preserveKey, value: 'true' })
+  }
+  if (!annotations.find((a) => a.key === nbIdKey)) {
+    annotations.push({ key: nbIdKey, value: String(nbId) })
+  }
+  set(values, 'ingress.platformClass.annotations', annotations)
+  d.info('Linode NodeBalancer annotations added to ingress.platformClass successfully')
+}
+
+export const removeSopsArtifacts = (deps = { existsSync, rmSync, globSync, terminal }): void => {
+  const d = deps.terminal(`cmd:${cmdName}:removeSopsArtifacts`)
+
+  // Remove .sops.yaml — makes encrypt()/decrypt() no-ops
+  const sopsConfigPath = `${env.ENV_DIR}/.sops.yaml`
+  if (deps.existsSync(sopsConfigPath)) {
+    deps.rmSync(sopsConfigPath)
+    d.info('Removed .sops.yaml')
+  }
+
+  // Remove SOPS-encrypted files
+  const sopsEncrypted = deps.globSync(`${env.ENV_DIR}/env/**/secrets.*.yaml`, { dot: false })
+  for (const f of sopsEncrypted) {
+    deps.rmSync(f)
+    d.info(`Removed ${f}`)
+  }
+
+  // Remove SOPS-decrypted files
+  const sopsDecrypted = deps.globSync(`${env.ENV_DIR}/env/**/secrets.*.yaml.dec`, { dot: false })
+  for (const f of sopsDecrypted) {
+    deps.rmSync(f)
+    d.info(`Removed ${f}`)
+  }
+
+  // Remove user YAML files — users are now managed via SealedSecrets in env/manifests/namespaces/apl-users/sealedsecrets.
+  // These files may contain SOPS-encrypted data that was written by the "Write default values" step
+  // before SOPS decryption ran, contaminating the public YAML files with ENC[...] strings.
+  const userFiles = deps.globSync(`${env.ENV_DIR}/env/users/*.yaml`, { dot: false })
+  for (const f of userFiles) {
+    deps.rmSync(f)
+    d.info(`Removed ${f}`)
+  }
+}
+
+export const sopsMigration = async (
+  values: Record<string, any>,
+  deps = {
+    existsSync,
+    globSync,
+    terminal,
+    getOrCreateSealedSecretsPem,
+    getExistingSealedSecretsCert,
+    getPemFromCertificate,
+    generateSealedSecretsKeyPair,
+    createSealedSecretsKeySecret,
+    buildSecretToNamespaceMap,
+    createSealedSecretManifest,
+    createUserSealedSecretManifests,
+    writeSealedSecretManifests,
+    applySealedSecretManifestsFromDir,
+    restartSealedSecretsController,
+    getK8sSecret,
+    getSchemaSecretsPaths,
+    removeSopsArtifacts,
+  },
+): Promise<void> => {
+  const d = deps.terminal(`cmd:${cmdName}:sopsMigration`)
+
+  // Idempotency guard: no SOPS config means migration already ran.
+  // However, if SealedSecret manifests exist on disk but the K8s Secrets are not yet
+  // decrypted (e.g. the operator was killed after writing manifests but before applying
+  // them, or the controller used its auto-generated key), re-apply them and restart
+  // the controller so subsequent steps can resolve the git password.
+  if (!deps.existsSync(`${env.ENV_DIR}/.sops.yaml`)) {
+    const existingManifests = deps.globSync(sealedSecretManifestsGlob, {
+      dot: false,
+    })
+    if (existingManifests.length > 0) {
+      try {
+        const platformSecret = await deps.getK8sSecret(OTOMI_SECRETS, SEALED_SECRETS_NAMESPACE)
+        if (!platformSecret) {
+          d.info('SealedSecret manifests exist but K8s Secrets are missing — re-applying and restarting controller')
+          await deps.applySealedSecretManifestsFromDir(env.ENV_DIR)
+          await deps.restartSealedSecretsController()
+        }
+      } catch {
+        d.info('Could not reach K8s API to check secrets, skipping re-apply')
+      }
+    }
+    d.info('No .sops.yaml found, skipping SOPS migration')
+    return
+  }
+
+  d.info('Starting SOPS to SealedSecrets migration')
+
+  // Get or generate sealed-secrets key
+  const pem = await deps.getOrCreateSealedSecretsPem({
+    terminal: deps.terminal,
+    getExistingSealedSecretsCert: deps.getExistingSealedSecretsCert,
+    getPemFromCertificate: deps.getPemFromCertificate,
+    generateSealedSecretsKeyPair: deps.generateSealedSecretsKeyPair,
+    createSealedSecretsKeySecret: deps.createSealedSecretsKeySecret,
+  })
+
+  // Build secret-to-namespace mappings
+  const teams = Object.keys((values.teamConfig as Record<string, any>) || {})
+  const mappings = await deps.buildSecretToNamespaceMap(values, teams, values)
+
+  // Create core SealedSecret manifests
+  const manifests: SealedSecretManifest[] = []
+  for (const mapping of mappings) {
+    const manifest = await deps.createSealedSecretManifest(pem, mapping)
+    manifests.push(manifest)
+  }
+
+  // Create user SealedSecret manifests
+  const users = values.users as any[] | undefined
+  if (Array.isArray(users) && users.length > 0) {
+    const userManifests = await deps.createUserSealedSecretManifests(users, pem)
+    manifests.push(...userManifests)
+  }
+
+  // Write manifests to disk
+  await deps.writeSealedSecretManifests(manifests, env.ENV_DIR)
+  d.info(`Wrote ${manifests.length} SealedSecret manifests`)
+
+  // Apply SealedSecret manifests to the cluster so the sealed-secrets controller
+  // can decrypt them into K8s Secrets before the apply step needs them.
+  d.info('Applying SealedSecret manifests to cluster')
+  await deps.applySealedSecretManifestsFromDir(env.ENV_DIR)
+
+  // Restart the sealed-secrets controller so it picks up the migration-generated key.
+  // Without this, the controller uses its auto-generated key and cannot decrypt.
+  d.info('Restarting sealed-secrets controller to use migration key')
+  await deps.restartSealedSecretsController()
+
+  // Strip secrets from values (in-place mutation — writeValues() persists after return)
+  const secretPaths = await deps.getSchemaSecretsPaths(teams)
+  for (const path of secretPaths) {
+    unset(values, path)
+  }
+
+  // Remove SOPS artifacts
+  deps.removeSopsArtifacts()
+  d.info('SOPS to SealedSecrets migration complete')
+}
+
+const setIngressDefault = async (values: Record<string, any>) => {
+  const d = terminal('setIngressDefault')
+  if (values?.cluster?.provider !== 'linode') {
+    // In non-Linode env, old and new setup co-exist in two separate LB services until this gets deactivated
+    set(values, 'apps.ingress-nginx-platform.enabled', true)
+    d.info('Skipping Linode NodeBalancer annotation migration: provider is not linode')
+    return
+  }
+  // The following is overridden during the pre-upgrade script
+  set(values, 'apps.ingress-nginx-platform.enabled', false)
+}
+
+const removeIngressTracing = async (values: Record<string, any>) => {
+  const apps: Record<string, any> = values?.apps ?? {}
+  Object.entries(apps).forEach(([key, value]) => {
+    if (key.startsWith('ingress-nginx-')) {
+      unset(value, 'tracing')
+    }
+  })
+}
+
 const customMigrationFunctions: Record<string, CustomMigrationFunction> = {
   networkPoliciesMigration,
   teamSettingsMigration,
@@ -746,6 +1205,12 @@ const customMigrationFunctions: Record<string, CustomMigrationFunction> = {
   workloadValuesMigration,
   setLokiStorageSchemaMigration,
   setDefaultAplCatalog,
+  valkeyAndOauth2RedisPVCMigration,
+  addLinodeNBAnnotations,
+  sopsMigration,
+  setIngressDefault,
+  addRedisSecretForArgoCD,
+  removeIngressTracing,
 }
 
 /**
@@ -803,7 +1268,7 @@ export const applyChanges = async (
       await customFunction(values)
     }
 
-    c.deletions?.forEach((entry) => unsetAtPath(entry, values))
+    c.deletions?.forEach((entry) => processDeletionEntry(entry, values))
     // Lastly we remove files
     for (const change of changes) {
       change.fileDeletions?.forEach((entry) => {
